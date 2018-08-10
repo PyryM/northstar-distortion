@@ -1,6 +1,8 @@
 import math
 import numpy as np
 import cv2
+import json
+import argparse
 
 def augment_homogeneous(V, augment):
     """ Augment a 3xN array of vectors into a 4xN array of homogeneous coordinates
@@ -123,7 +125,7 @@ def batch_transformed_intersect(T, P, V, intersect_func):
 
     return valid, P_intersect, P_i_loc, N
 
-def ns_forward_trace(T_ellipse, T_plane, P, V):
+def forward_trace(T_ellipse, T_plane, P, V):
     """ Trace rays to UV positions on the display plane in a Northstar configuration
 
     Args:
@@ -150,7 +152,22 @@ def ns_forward_trace(T_ellipse, T_plane, P, V):
         valid[UV[i, :] > 1.0] = False
     return valid, UV[0:2, :]
 
-def ns_forward_perspective_trace(T_ellipse, T_plane, fov, resolution):
+def rand_circular(n_samples):
+    """ Sample random points in a unit circle.
+
+    Args:
+        n_samples (int): Number of points to sample.
+    Returns:
+        (np.array 2xN): Array of samples.
+    """
+    length = np.random.uniform(0.0, 1.0, (n_samples))
+    angle = np.pi * np.random.uniform(0.0, 2.0, (n_samples))
+    ret = np.zeros((2, n_samples))
+    ret[0, :] = np.sqrt(length) * np.cos(angle)
+    ret[1, :] = np.sqrt(length) * np.sin(angle)
+    return ret
+
+def forward_perspective_trace(T_ellipse, T_plane, fov, resolution, jitter=0.0):
     """ Trace UVs for a perspective camera located at the origin.
 
     Args:
@@ -158,6 +175,7 @@ def ns_forward_perspective_trace(T_ellipse, T_plane, fov, resolution):
         T_plane (np.array 4x4): Display plane as transform of unit XY planar patch
         fov (float): Field of view (square aspect ratio) in radians
         resolution (int): Output resolution (square aspect ratio) in pixels
+        jitter (float): Amount to randomly jitter each sample point origin XY
 
     Returns:
         (np.array NxN, np.array NxN, np.array NxN): valid, U, V
@@ -166,11 +184,13 @@ def ns_forward_perspective_trace(T_ellipse, T_plane, fov, resolution):
     spts = np.linspace(-view_limit, view_limit, resolution)
     X, Y = np.meshgrid(spts, -spts)
     P = np.zeros((3, X.size))
+    if jitter > 0.0:
+        P[0:2, :] += rand_circular(P.shape[1]) * jitter
     V = np.zeros((3, X.size))
     V[0, :] = X.reshape(-1)
     V[1, :] = Y.reshape(-1)
     V[2, :] = -1.0
-    valid_pts, UV = ns_forward_trace(T_ellipse, T_plane, P, V)
+    valid_pts, UV = forward_trace(T_ellipse, T_plane, P, V)
     U = UV[0, :].reshape(X.shape)
     V = UV[1, :].reshape(X.shape)
     valid_mask = valid_pts.reshape(X.shape)
@@ -209,6 +229,19 @@ def map_image(u_map, v_map, im):
     return im_mapped
 
 def main():
+    parser = argparse.ArgumentParser(description='Compute Northstar forward/inverse distortion maps.')
+    parser.add_argument('configfile',
+                        help='Configuration .json to use')
+    parser.add_argument('--quality', type=int, default=64,
+                        help='Intermediate interpolation resolution (>128 will be very slow)')
+    parser.add_argument('--testimage', default='uvgrid.png',
+                        help='Image to use for testing projections.')
+    parser.add_argument('--outformat', default='exr',
+                        help='Output format (exr/png16/png8)')
+
+
+    args = parser.parse_args()
+
     #rendering
     view_fov = math.pi / 2.0 # 90 degrees fov
     compute_res = 64
@@ -238,14 +271,14 @@ def main():
     plane_tf = rotation_mat @ plane_tf
     plane_tf[0:3, 3] = np.array([-0.2, 0.0, -0.25])
 
-    valid, f_u, f_v = ns_forward_perspective_trace(ellipse_tf, plane_tf, 
+    valid, f_u, f_v = forward_perspective_trace(ellipse_tf, plane_tf, 
                                                                 view_fov, 
                                                                 compute_res)
     print("Computing inverse maps")
     inv_u, inv_v = compute_inverse_maps(valid, f_u, f_v, dest_size)
 
     print("Generating test images")
-    valid, f_u, f_v = ns_forward_perspective_trace(ellipse_tf, plane_tf, 
+    valid, f_u, f_v = forward_perspective_trace(ellipse_tf, plane_tf, 
                                                                 view_fov, 
                                                                 forward_res)
     uv_im = cv2.imread("uv.png")
@@ -255,6 +288,28 @@ def main():
     cv2.imwrite("inv_test.png", inv_im)
     round_trip_im = map_image(f_u, f_v, inv_im)
     cv2.imwrite("round_trip_test.png", round_trip_im)
+
+    print("Generating miscalibrated IPD image")
+    ellipse_tf_ipd = np.array([[e_a, 0.0, 0.0, -e_f + 0.01],
+                                [0.0, e_b, 0.0, 0.0],
+                                [0.0, 0.0, e_b, 0.0],
+                                [0.0, 0.0, 0.0, 1.0]])
+
+    valid, f_u, f_v = forward_perspective_trace(ellipse_tf_ipd, plane_tf, 
+                                                                view_fov, 
+                                                                forward_res) 
+    round_trip_im = map_image(f_u, f_v, inv_im)
+    cv2.imwrite("round_trip_test_incorrect_ipd.png", round_trip_im)
+
+    print("Generating focus image.")
+    n_samples = 100
+    accum_image = np.zeros((f_u.shape[0], f_u.shape[1], 3))
+    for i in range(n_samples):
+        valid, f_u, f_v = forward_perspective_trace(ellipse_tf, plane_tf, 
+                                                    view_fov, 
+                                                    forward_res, 0.01)
+        accum_image += map_image(f_u, f_v, uv_im)
+    cv2.imwrite("focus_test.png", (accum_image / n_samples).astype(np.uint8))
     print("Done")
 
 if __name__ == '__main__':
